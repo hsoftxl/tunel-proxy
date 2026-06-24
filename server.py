@@ -51,6 +51,7 @@ class TunnelServer:
             thread_name_prefix="tunnel"
         )
         self._running = False
+        self._cleaner_started = False
 
     def _clean_stale_pending(self):
         """后台线程：定期清理过期的 pending 连接"""
@@ -115,7 +116,7 @@ class TunnelServer:
         start_bw_reporter(self.bw)
 
         for remote_port, srv in list(self.pub_sockets.items()):
-            def accept_loop(s=srv, rp=remote_port):
+            def accept_loop(s=srv, rp=remote_port, ctrl=self.ctrl_conn):
                 while self._running:
                     try:
                         ext_conn, addr = s.accept()
@@ -124,7 +125,7 @@ class TunnelServer:
                         with self.lock:
                             self.pending[conn_id] = (ext_conn, time.time())
                         try:
-                            self.ctrl_conn.sendall(
+                            ctrl.sendall(
                                 f"NEW:{conn_id}:{rp}\n".encode())
                         except (ConnectionError, OSError):
                             return
@@ -161,6 +162,7 @@ class TunnelServer:
         logger.info("Cleanup done, waiting for new client...")
 
     def handle_client(self, conn, addr):
+        # 进入 handle_client 时状态已经由调用方 (run 中的 cleanup) 清理干净
         set_tcp_keepalive(conn)
         self.ctrl_conn = conn
         logger.info("Client connected from %s", addr)
@@ -208,6 +210,10 @@ class TunnelServer:
                     logger.info("Total %d port(s) mapped", len(self.port_map))
                     if not self.port_map:
                         logger.error("No ports mapped successfully")
+                        try:
+                            conn.sendall(b"MAP_FAIL:no_ports_bound\n")
+                        except (ConnectionError, OSError):
+                            pass
                         return False
                     try:
                         conn.sendall(b"MAP_OK\n")
@@ -216,9 +222,11 @@ class TunnelServer:
                     self.start_pub_listeners()
                     mapping_done = True
 
-        # 启动 pending 清理后台线程
+        # 启动 pending 清理后台线程（只启动一次，避免重连后重复创建）
         self._running = True
-        threading.Thread(target=self._clean_stale_pending, daemon=True).start()
+        if not self._cleaner_started:
+            self._cleaner_started = True
+            threading.Thread(target=self._clean_stale_pending, daemon=True).start()
 
         # 控制通道主循环
         last_activity = time.time()
@@ -295,6 +303,9 @@ class TunnelServer:
                     self.executor.submit(self.handle_data_conn, c)
                 except OSError:
                     break
+                except Exception:
+                    logger.exception("Data acceptor error, restarting")
+                    continue
 
         self._running = True
         threading.Thread(target=data_acceptor, daemon=True).start()
@@ -307,6 +318,8 @@ class TunnelServer:
             while True:
                 conn, addr = self.ctr.accept()
                 self.handle_client(conn, addr)
+                # 每次客户端断开后统一清理状态，下次 accept 前状态一定是干净的
+                self.cleanup()
         except KeyboardInterrupt:
             logger.info("Shutting down")
         except OSError:

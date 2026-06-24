@@ -54,6 +54,18 @@ class TunnelClient:
         if not local_port:
             logger.error("No mapping for remote port %d", remote_port)
             return
+        # 先连接本地服务，失败就不用浪费服务端的数据连接
+        local_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        local_sock.settimeout(5)
+        try:
+            local_sock.connect(('127.0.0.1', local_port))
+        except Exception as e:
+            local_sock.close()
+            logger.error("Tunnel %s -> 127.0.0.1:%d failed: %s",
+                         conn_id, local_port, e)
+            return
+        local_sock.settimeout(None)
+
         try:
             data_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             set_tcp_keepalive(data_sock)
@@ -61,15 +73,13 @@ class TunnelClient:
             data_sock.connect((self.server_host, self.data_port))
             data_sock.settimeout(None)
             data_sock.sendall(f"{conn_id}\n".encode())
-
-            local_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            local_sock.settimeout(5)
-            local_sock.connect(('127.0.0.1', local_port))
-            local_sock.settimeout(None)
-
-            self.forward(data_sock, local_sock)
         except Exception as e:
-            logger.error("Error %s: %s", conn_id, e)
+            local_sock.close()
+            data_sock.close()
+            logger.error("Tunnel %s data conn failed: %s", conn_id, e)
+            return
+
+        self.forward(data_sock, local_sock)
 
     def connect_once(self):
         ctrl = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -107,7 +117,14 @@ class TunnelClient:
             logger.error("MAP_OK timeout")
             ctrl.close()
             return False
-        if resp != "MAP_OK":
+        if resp == "MAP_OK":
+            pass  # 下方继续
+        elif resp and resp.startswith("MAP_FAIL:"):
+            reason = resp[9:]
+            logger.error("Server rejected mappings: %s", reason)
+            ctrl.close()
+            return False
+        else:
             logger.error("Server rejected mappings: %s", resp)
             ctrl.close()
             return False
@@ -173,16 +190,21 @@ class TunnelClient:
 
     def run(self):
         delay = 1  # 初始重连间隔（秒）
+        normal_delay = 1  # 正常断开后也稍等再重连
         while True:
             try:
                 ok = self.connect_once()
+            except KeyboardInterrupt:
+                logger.info("Shutting down")
+                self.executor.shutdown(wait=False)
+                break
             except Exception as e:
                 logger.error("Connection error: %s", e)
                 ok = False
 
             if ok:
                 logger.info("Disconnected, reconnecting...")
-                delay = 1  # 正常断开后重置间隔
+                delay = normal_delay
             else:
                 logger.info("Reconnecting in %ds...", delay)
 
