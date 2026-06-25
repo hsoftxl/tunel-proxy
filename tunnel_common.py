@@ -133,19 +133,24 @@ def tunnel_forward(a, b, bw_monitor=None, idle_timeout=None):
             pass
 
 
-def start_bw_reporter(bw_monitor, interval=5, prefix="BW"):
-    """启动带宽报告线程（daemon），每隔 interval 秒打印一次"""
+def start_bw_reporter(bw_monitor, interval=30, prefix="BW",
+                      min_speed=1024):
+    """启动带宽报告线程（daemon），每隔 interval 秒打印一次
+
+    只有当平均带宽 > min_speed 时才输出日志，避免低频日志干扰。
+    """
     def _reporter():
         while True:
             time.sleep(interval)
             speed = bw_monitor.report()
-            if speed > 0:
-                if speed > 1024 * 1024:
-                    logger.info(f"[{prefix}] {speed / 1024 / 1024:.1f} MB/s")
-                elif speed > 1024:
-                    logger.info(f"[{prefix}] {speed / 1024:.1f} KB/s")
-                else:
-                    logger.info(f"[{prefix}] {speed:.0f} B/s")
+            if speed <= min_speed:
+                continue
+            if speed > 1024 * 1024:
+                logger.info(f"[{prefix}] {speed / 1024 / 1024:.1f} MB/s")
+            elif speed > 1024:
+                logger.info(f"[{prefix}] {speed / 1024:.1f} KB/s")
+            else:
+                logger.info(f"[{prefix}] {speed:.0f} B/s")
     t = threading.Thread(target=_reporter, daemon=True)
     t.start()
     return t

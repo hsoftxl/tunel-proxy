@@ -136,6 +136,17 @@ class TunnelClient:
         last_heartbeat = time.time()
         buf = b''
         while True:
+            now = time.time()
+
+            # 每到心跳间隔就发 PING，不依赖 select 超时
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                try:
+                    ctrl.sendall(b"PING\n")
+                    last_heartbeat = now
+                except (ConnectionError, OSError):
+                    logger.error("Heartbeat send failed")
+                    break
+
             try:
                 readable, _, exceptional = select.select(
                     [ctrl], [], [ctrl], HEARTBEAT_INTERVAL)
@@ -146,17 +157,7 @@ class TunnelClient:
                 logger.error("Control socket error")
                 break
 
-            now = time.time()
-
             if not readable:
-                # select 超时 → 发送心跳
-                if now - last_heartbeat >= HEARTBEAT_INTERVAL:
-                    try:
-                        ctrl.sendall(b"PING\n")
-                        last_heartbeat = now
-                    except (ConnectionError, OSError):
-                        logger.error("Heartbeat send failed")
-                        break
                 continue
 
             try:

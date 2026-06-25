@@ -52,6 +52,7 @@ class TunnelServer:
         )
         self._running = False
         self._cleaner_started = False
+        self._bw_reporter_started = False
 
     def _clean_stale_pending(self):
         """后台线程：定期清理过期的 pending 连接"""
@@ -99,21 +100,38 @@ class TunnelServer:
         if not validate_port(remote_port):
             logger.error("Invalid port: %d", remote_port)
             return False
-        try:
-            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            # macOS 下 SO_REUSEPORT 可选
-            srv.bind(('0.0.0.0', remote_port))
-            srv.listen(100)
-            self.pub_sockets[remote_port] = srv
-            logger.info("Bound :%d", remote_port)
-            return True
-        except Exception as e:
-            logger.error("Bind :%d failed: %s", remote_port, e)
-            return False
+
+        # 重试绑定：macOS 下 close->bind 有延迟窗口，重试 3 次
+        for attempt in range(1, 4):
+            try:
+                srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # macOS 需要 SO_REUSEPORT 才能在 close→bind 快速切换
+                if hasattr(socket, 'SO_REUSEPORT'):
+                    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                srv.bind(('0.0.0.0', remote_port))
+                srv.listen(100)
+                self.pub_sockets[remote_port] = srv
+                logger.info("Bound :%d", remote_port)
+                return True
+            except OSError as e:
+                srv.close()
+                if e.errno == 98 or e.errno == 48:  # EADDRINUSE
+                    if attempt < 3:
+                        logger.warning("Bind :%d in use (attempt %d/3), retrying...",
+                                       remote_port, attempt)
+                        time.sleep(0.5 * attempt)
+                        continue
+                logger.error("Bind :%d failed: %s", remote_port, e)
+                return False
+            except Exception as e:
+                logger.error("Bind :%d failed: %s", remote_port, e)
+                return False
 
     def start_pub_listeners(self):
-        start_bw_reporter(self.bw)
+        if not self._bw_reporter_started:
+            self._bw_reporter_started = True
+            start_bw_reporter(self.bw)
 
         for remote_port, srv in list(self.pub_sockets.items()):
             def accept_loop(s=srv, rp=remote_port, ctrl=self.ctrl_conn):
@@ -322,8 +340,13 @@ class TunnelServer:
                 self.cleanup()
         except KeyboardInterrupt:
             logger.info("Shutting down")
-        except OSError:
-            pass
+        except OSError as e:
+            # 不静默退出：记录日志，让上层重启
+            logger.error("Control socket error: %s — exiting", e)
+            raise
+        except Exception:
+            logger.exception("Unexpected error in main loop — exiting")
+            raise
         finally:
             self._running = False
             self.cleanup()
